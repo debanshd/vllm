@@ -1887,6 +1887,21 @@ class MambaManager(SingleTypeKVCacheManager):
                 for entry in self._pending_boundary_state_offloads
                 if entry[0] != request_id
             ]
+            req_blocks = self.req_to_blocks.get(request_id, [])
+            for block in req_blocks:
+                if block.block_hash is not None and block.block_hash in self.cached_blocks_this_step:
+                    self.cached_blocks_this_step.remove(block.block_hash)
+                    self.block_pool._maybe_evict_cached_block(block)
+                if block.block_id in self.block_pool.cached_block_hashes_by_block:
+                    hashes = list(self.block_pool.cached_block_hashes_by_block[block.block_id])
+                    for h in hashes:
+                        if h in self.cached_blocks_this_step:
+                            self.cached_blocks_this_step.remove(h)
+                            if self.block_pool.cached_block_hash_to_block.contain(h, block.block_id):
+                                self.block_pool.cached_block_hash_to_block.pop(h, block.block_id)
+                            self.block_pool.cached_block_hashes_by_block[block.block_id].remove(h)
+                            if not self.block_pool.cached_block_hashes_by_block[block.block_id]:
+                                del self.block_pool.cached_block_hashes_by_block[block.block_id]
         return super().pop_blocks_for_free(request_id)
 
     def get_num_skipped_tokens(self, num_computed_tokens: int) -> int:
