@@ -8,6 +8,8 @@ from __future__ import annotations
 from collections.abc import Sequence
 from dataclasses import dataclass
 
+import regex as re
+
 from vllm.parser.engine.events import EventType, SemanticEvent
 from vllm.parser.engine.incremental_lexer import (
     CONTENT_TERMINAL,
@@ -65,8 +67,6 @@ def _build_drop_info(
     if not drop_texts:
         return None
 
-    import regex as re
-
     drop_terminal_defs = [
         TerminalDef(
             name=DROP_TERMINAL,
@@ -84,6 +84,48 @@ def _build_drop_info(
         lexer_shape=lexer_shape,
         extra_token_ids=extra_token_ids,
     )
+
+
+class FenceTracker:
+    def __init__(self) -> None:
+        self.is_open = False
+        self.char = ""
+        self.count = 0
+        self.unmatched = "\n"
+
+    def reset(self) -> None:
+        self.is_open = False
+        self.char = ""
+        self.count = 0
+        self.unmatched = "\n"
+
+    def feed(self, text: str) -> None:
+        buf = self.unmatched + text
+        lines = buf.split("\n")
+        self.unmatched = lines.pop()
+
+        for line in lines:
+            m = re.match(r"^ {0,3}(`{3,}|~{3,})", line)
+            if not self.is_open:
+                if m:
+                    fence = m.group(1)
+                    char = fence[0]
+                    info_string = line[m.end() :]
+                    if char == "`" and "`" in info_string:
+                        continue
+                    self.is_open = True
+                    self.char = char
+                    self.count = len(fence)
+            else:
+                if m:
+                    fence = m.group(1)
+                    char = fence[0]
+                    if (
+                        char == self.char
+                        and len(fence) >= self.count
+                        and not line[m.end() :].strip()
+                    ):
+                        self.is_open = False
 
 
 class StreamingParserEngine:
@@ -168,6 +210,11 @@ class StreamingParserEngine:
             self._compute_reasoning_markup_terminals()
         )
 
+        self._fence_trackers = {
+            ParserState.CONTENT: FenceTracker(),
+            ParserState.REASONING: FenceTracker(),
+        }
+
         self.skip_tool_parsing = False
         self.skip_reasoning_parsing = False
         self.reset(initial_state=initial_state)
@@ -213,6 +260,9 @@ class StreamingParserEngine:
         self._message_header_token_count = 0
         self._in_skipped_tool_span = False
         self._reset_args_state()
+        if hasattr(self, "_fence_trackers"):
+            for tracker in self._fence_trackers.values():
+                tracker.reset()
 
     def feed(
         self,
@@ -236,6 +286,9 @@ class StreamingParserEngine:
                     has_special = True
                     break
             if not has_special:
+                tracker = self._fence_trackers.get(self.state)
+                if tracker is not None:
+                    tracker.feed(delta_text)
                 events = self._emit_for_state(
                     delta_text, token_count=len(delta_token_ids)
                 )
@@ -248,6 +301,9 @@ class StreamingParserEngine:
             item = scanner_items[0]
             lex_tokens = self._lexer.feed(item.text, item.token_texts, item.token_count)
             if len(lex_tokens) == 1 and lex_tokens[0].terminal == CONTENT_TERMINAL:
+                tracker = self._fence_trackers.get(self.state)
+                if tracker is not None:
+                    tracker.feed(lex_tokens[0].value)
                 events = self._emit_for_state(
                     lex_tokens[0].value,
                     token_count=lex_tokens[0].token_count,
@@ -397,6 +453,14 @@ class StreamingParserEngine:
     def _on_terminal(
         self, terminal: str, value: str, token_count: int = 0
     ) -> list[SemanticEvent]:
+        tracker = self._fence_trackers.get(self.state)
+        if tracker is not None and tracker.is_open and terminal in self._tool_terminals:
+            tracker.feed(value)
+            return self._emit_for_state(value, token_count)
+
+        if tracker is not None:
+            tracker.feed(value)
+
         key = (self.state, terminal)
         transition = self.config.transitions.get(key)
 
@@ -499,6 +563,9 @@ class StreamingParserEngine:
     def _on_content(self, text: str, token_count: int = 0) -> list[SemanticEvent]:
         if not text:
             return []
+        tracker = self._fence_trackers.get(self.state)
+        if tracker is not None:
+            tracker.feed(text)
         return self._emit_for_state(text, token_count)
 
     def _apply_transition(
